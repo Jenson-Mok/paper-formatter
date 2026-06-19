@@ -1,0 +1,15 @@
+# 测试文件
+test_*.docx
+test_*.docx.bak*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份文件
+*.bak
+*.bak.*
+
+# 临时文件
+*.tmp
