@@ -333,9 +333,12 @@ def apply_header_footer(doc: Document, hf_config: dict):
             footer = section.footer
             footer.is_linked_to_previous = False
             position = hf_config.get("page_number_position", "center")
-            # 添加页码域代码
+            # 添加页码域代码 — 必须五段式: begin → instrText → separate → t → end
             if footer.paragraphs:
                 para = footer.paragraphs[0]
+                # 清空旧内容
+                for run in para.runs:
+                    run._element.getparent().remove(run._element)
             else:
                 para = footer.add_paragraph()
 
@@ -344,18 +347,29 @@ def apply_header_footer(doc: Document, hf_config: dict):
             elif position == "right":
                 para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-            # 添加 PAGE 域
-            run = para.add_run()
-            fldChar_begin = parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="begin"/>')
-            run._element.append(fldChar_begin)
-
+            # 1. begin
+            run1 = para.add_run()
+            run1._element.append(
+                parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="begin"/>')
+            )
+            # 2. instrText (字段指令)
             run2 = para.add_run()
-            instrText = parse_xml(f'<w:instrText {nsdecls("w")} xml:space="preserve"> PAGE </w:instrText>')
-            run2._element.append(instrText)
-
+            run2._element.append(
+                parse_xml(f'<w:instrText {nsdecls("w")} xml:space="preserve"> PAGE </w:instrText>')
+            )
+            # 3. separate (分隔符 — 关键！缺少会导致 Word 不渲染)
             run3 = para.add_run()
-            fldChar_end = parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>')
-            run3._element.append(fldChar_end)
+            run3._element.append(
+                parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="separate"/>')
+            )
+            # 4. 显示文本（缓存值）
+            run4 = para.add_run()
+            run4.text = "1"
+            # 5. end
+            run5 = para.add_run()
+            run5._element.append(
+                parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>')
+            )
 
 
 def remove_empty_paragraphs(doc: Document):
@@ -374,7 +388,11 @@ def remove_empty_paragraphs(doc: Document):
 # ══════════════════════════════════════════════════════════════════
 
 def extract_template_styles(template_path: str) -> dict:
-    """从模版 .docx 提取格式配置."""
+    """从模版 .docx 提取格式配置.
+
+    使用 python-docx 的已解析样式属性（自动处理 docDefaults→style→run 继承链）,
+    避免直接读 XML 可能遗漏 docDefaults 层的问题.
+    """
     doc = Document(template_path)
     config = {}
 
@@ -428,26 +446,99 @@ def extract_template_styles(template_path: str) -> dict:
     if headings_config:
         config["headings"] = headings_config
 
-    # 提取正文字体（采样前几个段落）
-    font_names = []
-    font_sizes = []
-    for para in doc.paragraphs[:20]:
-        style_name = para.style.name if para.style else ""
-        if "heading" in style_name.lower() or "标题" in style_name:
-            continue
-        for run in para.runs:
-            if run.font.name:
-                font_names.append(run.font.name)
-            if run.font.size:
-                font_sizes.append(run.font.size / 12700)
+    # 提取正文字体 — 优先使用 python-docx 解析的 Normal 样式值（自动处理继承链）
+    try:
+        normal_style = doc.styles['Normal']
+        body_font = {}
 
-    if font_names or font_sizes:
-        config["body_font"] = {}
-        if font_names:
-            config["body_font"]["name_cn"] = max(set(font_names), key=font_names.count)
-            config["body_font"]["name_en"] = max(set(font_names), key=font_names.count)
-        if font_sizes:
-            config["body_font"]["size_pt"] = round(sum(font_sizes) / len(font_sizes), 1)
+        # 西文字体名（已解析）
+        if normal_style.font.name:
+            body_font["name_en"] = normal_style.font.name
+        if normal_style.font.size:
+            body_font["size_pt"] = round(normal_style.font.size / 12700, 1)
+        if normal_style.font.bold is not None:
+            body_font["bold"] = normal_style.font.bold
+        if normal_style.font.italic is not None:
+            body_font["italic"] = normal_style.font.italic
+
+        # 东亚字体需从 XML rFonts/@eastAsia 获取（python-docx 的 font.name 不区分东亚/西文）
+        W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        rPr = normal_style.element.find(f'{{{W}}}rPr')
+        if rPr is not None:
+            rFonts = rPr.find(f'{{{W}}}rFonts')
+            if rFonts is not None:
+                ea = rFonts.get(f'{{{W}}}eastAsia')
+                if ea:
+                    body_font["name_cn"] = ea
+        # 兜底：如果 style 级别没有，查 docDefaults
+        if "name_cn" not in body_font:
+            dd = normal_style.element.getroottree().getroot().find(f'{{{W}}}docDefaults')
+            if dd is not None:
+                rPrD = dd.find(f'{{{W}}}rPrDefault')
+                if rPrD is not None:
+                    rPr2 = rPrD.find(f'{{{W}}}rPr')
+                    if rPr2 is not None:
+                        rf2 = rPr2.find(f'{{{W}}}rFonts')
+                        if rf2 is not None:
+                            ea2 = rf2.get(f'{{{W}}}eastAsia')
+                            if ea2:
+                                body_font["name_cn"] = ea2
+                            asc2 = rf2.get(f'{{{W}}}ascii')
+                            if asc2 and "name_en" not in body_font:
+                                body_font["name_en"] = asc2
+
+        if body_font:
+            config["body_font"] = body_font
+
+        # 段落格式（行距、对齐等）
+        para_config = {}
+        pf = normal_style.paragraph_format
+        if pf.line_spacing is not None:
+            para_config["line_spacing"] = pf.line_spacing
+        if pf.alignment is not None:
+            align_map = {
+                WD_ALIGN_PARAGRAPH.LEFT: "left",
+                WD_ALIGN_PARAGRAPH.CENTER: "center",
+                WD_ALIGN_PARAGRAPH.RIGHT: "right",
+                WD_ALIGN_PARAGRAPH.JUSTIFY: "justify",
+            }
+            para_config["alignment"] = align_map.get(pf.alignment, "left")
+        if pf.first_line_indent is not None:
+            para_config["first_line_indent_cm"] = round(pf.first_line_indent / 360000, 2)
+        if para_config:
+            config["paragraph"] = para_config
+
+    except KeyError:
+        # 兜底：从正文段落中采样（当 Normal 样式不存在时）
+        font_names_cn = []
+        font_names_en = []
+        font_sizes = []
+        for para in doc.paragraphs[:20]:
+            style_name = para.style.name if para.style else ""
+            if "heading" in style_name.lower() or "标题" in style_name:
+                continue
+            for run in para.runs:
+                if run.font.name:
+                    font_names_en.append(run.font.name)
+                if run.font.size:
+                    font_sizes.append(run.font.size / 12700)
+                # 从 XML 抽取东亚字体
+                rPr_elem = run._element.find(f'{{{W}}}rPr')
+                if rPr_elem is not None:
+                    rf_elem = rPr_elem.find(f'{{{W}}}rFonts')
+                    if rf_elem is not None:
+                        ea_elem = rf_elem.get(f'{{{W}}}eastAsia')
+                        if ea_elem:
+                            font_names_cn.append(ea_elem)
+
+        if font_names_cn or font_names_en or font_sizes:
+            config["body_font"] = {}
+            if font_names_cn:
+                config["body_font"]["name_cn"] = max(set(font_names_cn), key=font_names_cn.count)
+            if font_names_en:
+                config["body_font"]["name_en"] = max(set(font_names_en), key=font_names_en.count)
+            if font_sizes:
+                config["body_font"]["size_pt"] = round(sum(font_sizes) / len(font_sizes), 1)
 
     return config
 
